@@ -1,0 +1,63 @@
+name: crawl-stars
+on:
+  workflow_dispatch:   # allows manual runs
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: github
+          POSTGRES_PASSWORD: github
+          POSTGRES_DB: github
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U github -d github"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://github:github@localhost:5432/github
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..10}; do
+            pg_isready -h localhost -p 5432 -U github && break
+            sleep 3
+          done
+
+      - name: Create DB schema
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f create_tables.sql
+
+      - name: Crawl stars
+        run: |
+          python crawl_stars.py
+
+      - name: Dump DB to CSV
+        run: |
+          psql "$DATABASE_URL" -c "COPY (SELECT * FROM repositories) TO STDOUT WITH CSV HEADER" > repos.csv
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repos-csv
+          path: repos.csv
