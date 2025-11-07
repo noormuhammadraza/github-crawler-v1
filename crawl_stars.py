@@ -1,4 +1,4 @@
-import os, json, time
+import os, json, time, datetime
 import requests
 import psycopg2
 from psycopg2.extras import execute_values
@@ -24,6 +24,7 @@ query($q:String!, $first:Int!, $after:String) {
         stargazerCount
         primaryLanguage { name }
         owner { login }
+        createdAt
       }
     }
   }
@@ -45,23 +46,40 @@ def upsert_repos(conn, rows):
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=60))
 def graphql_request(payload):
     r = requests.post(GITHUB_API, json=payload, headers=HEADERS)
+    if r.status_code >= 500:
+        raise Exception(f"Server error: {r.status_code}")
     data = r.json()
     if "errors" in data:
-        raise Exception(f"GraphQL error: {data['errors']}")
+        raise Exception(f"GraphQL errors: {data['errors']}")
     return data
 
-def crawl_segment(conn, query):
+def crawl_segment(conn, query, max_pages=10):
     after = None
     page = 0
-    while page < 3:  # limit pages per run for safety
-        variables = {"q": query, "first": 50, "after": after}
+    while page < max_pages:
+        variables = {"q": query, "first": 100, "after": after}
         res = graphql_request({"query": GRAPHQL_QUERY, "variables": variables})
-        nodes = res["data"]["search"]["nodes"]
-        rate = res["data"]["rateLimit"]
-        print(f"Remaining: {rate['remaining']}")
+        data = res.get("data", {})
+        if not data:
+            break
 
-        rows = []
+        rate = data.get("rateLimit", {})
+        remaining = rate.get("remaining")
+        resetAt = rate.get("resetAt")
+
+        if remaining is not None and remaining < 100:
+            reset_ts = datetime.fromisoformat(resetAt.replace("Z", "+00:00")).timestamp()
+            sleep_time = max(0, reset_ts - time.time()) + 10
+            print(f"[Throttle] Sleeping {sleep_time:.0f}s (remaining={remaining})")
+            time.sleep(sleep_time)
+
+        search = data["search"]
+        nodes = search["nodes"]
+        if not nodes:
+            break
+
         now = datetime.now(timezone.utc).isoformat()
+        rows = []
         for n in nodes:
             rows.append((
                 n["databaseId"],
@@ -74,21 +92,43 @@ def crawl_segment(conn, query):
                 now,
                 json.dumps(n)
             ))
-        upsert_repos(conn, rows)
-        print(f"Inserted {len(rows)} rows, page {page+1}")
 
-        pageInfo = res["data"]["search"]["pageInfo"]
+        upsert_repos(conn, rows)
+        print(f"Inserted {len(rows)} rows from query='{query}', page={page+1}")
+
+        pageInfo = search["pageInfo"]
         if not pageInfo["hasNextPage"]:
             break
         after = pageInfo["endCursor"]
         page += 1
-        time.sleep(2)
+
+        time.sleep(2)  # polite delay between pages
+
+def generate_date_segments(start_year=2015, end_year=2025):
+    segments = []
+    for year in range(start_year, end_year):
+        for month in range(1, 13):
+            start = datetime(year, month, 1)
+            if month == 12:
+                end = datetime(year+1, 1, 1)
+            else:
+                end = datetime(year, month+1, 1)
+            query = f"created:{start.date()}..{end.date()} is:public sort:stars-desc"
+            segments.append(query)
+    return segments
 
 def main():
     conn = psycopg2.connect(DB_URL)
-    queries = ["stars:>10000 sort:stars-desc", "stars:5000..9999 sort:stars-desc"]
-    for q in queries:
-        crawl_segment(conn, q)
+    segments = generate_date_segments(2015, 2025)
+
+    for i, q in enumerate(segments):
+        print(f"\n=== Segment {i+1}/{len(segments)}: {q} ===")
+        try:
+            crawl_segment(conn, q)
+        except Exception as e:
+            print(f"Error in segment {q}: {e}")
+            continue
+
     conn.close()
 
 if __name__ == "__main__":
